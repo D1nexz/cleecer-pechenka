@@ -1,25 +1,68 @@
 import os
+import platform
 import sys
 import threading
 import time
 
-import ctypes
+IS_WINDOWS = (sys.platform == 'win32')
 
-# Важно: вызываем ДО импорта pyautogui. Без этого Windows с масштабом 125–150%
-# отдаёт скриншот в логическом разрешении, а модель обучалась на физических
-# пикселях (~1919x1079) — из-за этого печенька не распознавалась.
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
-except Exception:
+# =====================================================================
+# Кроссплатформенная настройка DPI / графической среды
+# =====================================================================
+# Важно: вызываем ДО импорта библиотек скриншотов. Без этого Windows
+# с масштабом 125–150% отдаёт скриншот в логическом разрешении, а модель
+# обучалась на физических пикселях (~1919x1079) — печенька не распознавалась.
+if IS_WINDOWS:
+    import ctypes
+
     try:
-        ctypes.windll.user32.SetProcessDPIAware()
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
     except Exception:
-        pass
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+else:
+    # Linux/macOS: настройка Windows-DPI не нужна. Под Linux важно, чтобы
+    # скриншоты и клики были в ОДНОЙ системе координат: и mss, и pyautogui
+    # работают в координатах X11 root window. Сессия должна быть X11
+    # (не Wayland) — подробности в README.
+    print(f"Платформа: {platform.system()} ({sys.platform}) — "
+          "настройка DPI Windows пропущена (это нормально).")
+    # Wayland не умеет перехватывать мышь и делать полноэкранные скриншоты
+    # так же просто, как X11. Заранее предупредим пользователя.
+    if 'WAYLAND_DISPLAY' in os.environ and 'DISPLAY' not in os.environ:
+        print("ПРЕДУПРЕЖДЕНИЕ: обнаружена Wayland-сессия (WAYLAND_DISPLAY), "
+              "которая НЕ поддерживается pyautogui/mss для захвата экрана.\n"
+              "  Войдите в сессию X11 (Xorg): в менеджере входа выберите "
+              "'Ubuntu on Xorg' / 'GNOME on Xorg' и перезайдите.")
+    elif os.environ.get('DISPLAY'):
+        print(f"  Дисплей: DISPLAY={os.environ['DISPLAY']}")
+    else:
+        print("ПРЕДУПРЕЖДЕНИЕ: переменная DISPLAY не задана — похоже, вы "
+              "запускаете в headless-режиме (без графической сессии). "
+              "Кликеру нужен запущенный графический стол.")
 
 import cv2
 import numpy as np
 import pyautogui
 from ultralytics import YOLO
+
+# Скриншоты: на Linux предпочитаем mss — он работает через X11 напрямую
+# и НЕ требует системного пакета scrot, без которого pyautogui.screenshot()
+# под Linux выбрасывает ошибку. На Windows оставляем pyautogui (DPI уже задан).
+try:
+    import mss
+    import mss.tools as mss_tools
+
+    _MSS = mss.mss()
+    USE_MSS = True
+    print(f"Скриншоты: mss (мониторов: {len(_MSS.monitors)})")
+except Exception as exc:
+    _MSS = None
+    USE_MSS = False
+    print(f"ВНИМАНИЕ: mss недоступен ({exc}) — скриншоты через pyautogui "
+          "(на Linux тогда нужен системный пакет scrot).")
 
 pyautogui.FAILSAFE = True  # рывок мыши в угол экрана — экстренная остановка
 
@@ -151,6 +194,12 @@ GAME_MAX_AREA_RATIO = env_float("GAME_MAX_AREA", 0.25)    # <= 25% площад�
 SCREEN_AREA = 0
 SCREEN_WIDTH = 0
 SCREEN_HEIGHT = 0
+# Смещение главного монитора относительно root-окна X11 (для Linux/mss).
+# При использовании mss координаты пикселей в скриншоте локальны для монитора,
+# а pyautogui.click() работает в глобальных координатах X11. Нужно добавлять
+# смещение при кликах.
+MONITOR_OFFSET_X = 0
+MONITOR_OFFSET_Y = 0
 
 
 # =====================================================================
@@ -317,28 +366,69 @@ print(f"Класс(ы) прокачки (upgrade LvL): {UPGRADE_CLASSES}")
 print(f"Класс(ы) золотой печеньки (bonus): {BONUS_CLASSES}")
 
 
-def init_screen():
-    """Один скриншот ДО старта потоков: задаёт физические размеры экрана."""
-    global SCREEN_AREA, SCREEN_WIDTH, SCREEN_HEIGHT
+def take_screenshot_mss():
+    """Скриншот всего экрана через mss — работает на Linux без scrot."""
+    global SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_AREA, MONITOR_OFFSET_X, MONITOR_OFFSET_Y
+    # mss: monitor=0 — полный снимок всех мониторов (как rect всех вместе).
+    # 1-й монитор (основной) — monitor=1. Берём монитор 1.
+    sct = _MSS
+    monitor = sct.monitors[1]  # 1 = главный монитор
+    img = sct.grab(monitor)
+    SCREEN_WIDTH = monitor["width"]
+    SCREEN_HEIGHT = monitor["height"]
+    SCREEN_AREA = SCREEN_WIDTH * SCREEN_HEIGHT
+    # В mss координаты monitor 1 могут начинаться не с (0,0) на Linux
+    # (например, если главный монитор смещён в виртуальном root-пространстве).
+    # pyautogui.click() ждёт глобальные X11-координаты, поэтому сохраняем
+    # смещение монитора и добавляем его при клике.
+    MONITOR_OFFSET_X = int(monitor.get("left", 0))
+    MONITOR_OFFSET_Y = int(monitor.get("top", 0))
+    if MONITOR_OFFSET_X or MONITOR_OFFSET_Y:
+        print(f"  монитор 1 смещён: +({MONITOR_OFFSET_X}, {MONITOR_OFFSET_Y})")
+    # img — BGRA (с альфа-каналом), конвертируем в RGB, потом в BGR.
+    arr = np.frombuffer(img.rgb, dtype=np.uint8).reshape(
+        (monitor["height"], monitor["width"], 3))
+    frame = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    return np.ascontiguousarray(frame)
+
+
+def take_screenshot_pyautogui():
+    """Скриншот через pyautogui (Windows / Linux с scrot)."""
+    global SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_AREA
     screenshot = pyautogui.screenshot()
     SCREEN_WIDTH = screenshot.width
     SCREEN_HEIGHT = screenshot.height
     SCREEN_AREA = SCREEN_WIDTH * SCREEN_HEIGHT
-    return np.ascontiguousarray(cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR))
-
-
-def take_screenshot():
-    """Скриншот экрана, BGR-массив, как ждёт YOLO."""
-    screenshot = pyautogui.screenshot()
     frame = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
     return np.ascontiguousarray(frame)
 
 
+def init_screen():
+    """Один скриншот ДО старта потоков: задаёт физические размеры экрана."""
+    if USE_MSS:
+        return take_screenshot_mss()
+    return take_screenshot_pyautogui()
+
+
+def take_screenshot():
+    """Скриншот экрана, BGR-массив, как ждёт YOLO."""
+    if USE_MSS:
+        return take_screenshot_mss()
+    return take_screenshot_pyautogui()
+
+
 def click_xy(x, y):
-    """Один клик мыши в координатах экрана (в пределах экрана)."""
+    """Один клик мыши в координатах экрана (в пределах экрана).
+
+    При работе через mss координаты детекций локальны для монитора,
+    поэтому добавляем смещение монитора -> глобальные X11-координаты,
+    которые принимает pyautogui.click().
+    """
     if SCREEN_WIDTH > 0 and SCREEN_HEIGHT > 0:
         x = max(0, min(int(x), SCREEN_WIDTH - 1))
         y = max(0, min(int(y), SCREEN_HEIGHT - 1))
+    x += MONITOR_OFFSET_X
+    y += MONITOR_OFFSET_Y
     if DRY_RUN:
         return
     pyautogui.click(x, y)
