@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.env
+venv/
+.venv/
+
+# YOLO / Ultralytics
+# Обученная модель (best.pt) и результаты обучения НУЖНЫ репозиторию,
+# чтобы проект работал на другом компе без переобучения.
+# Исключаем только лишний кэш тренеровки, но не сами веса.
+runs/detect/**/weights/*.cache
+*.cache
+*.pth
+*.onnx
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
