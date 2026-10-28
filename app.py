@@ -48,6 +48,13 @@ import numpy as np
 import pyautogui
 from ultralytics import YOLO
 
+try:
+    from pynput import keyboard as _kb  # глобальный слушатель клавиатуры (пробел)
+    HAS_PYNPUT = True
+except ImportError:
+    _kb = None
+    HAS_PYNPUT = False
+
 # Скриншоты: на Linux предпочитаем mss — он работает через X11 напрямую
 # и НЕ требует системного пакета scrot, без которого pyautogui.screenshot()
 # под Linux выбрасывает ошибку. На Windows оставляем pyautogui (DPI уже задан).
@@ -767,7 +774,8 @@ if __name__ == '__main__':
         print("    РЕЖИМ DRY_RUN=1: клики НЕ выполняются, только диагностика.")
     if RUN_SECONDS > 0:
         print(f"    Остановлюсь через {RUN_SECONDS:.0f} сек (RUN_SECONDS).")
-    print("Нажмите Ctrl+C для остановки. Рывок мыши в угол экрана — экстренная остановка.")
+    print("Управление ПРОБЕЛом: 1-е нажатие — ЗАПУСК, 2-е — остановка программы. "
+          "Ctrl+C тоже работает. Рывок мыши в угол экрана — экстренная остановка.")
 
     # ---- Самопроверка: покажем, что модель видит на текущем экране ----
     # Первый скриншот заодно фиксирует физические размеры экрана (до старта
@@ -793,6 +801,56 @@ if __name__ == '__main__':
     except Exception as exc:
         print(f"Самопроверка не удалась: {exc}")
 
+    # =====================================================================
+    # Управление ПРОБЕЛом: 1-е нажатие — ЗАПУСК бота, 2-е — остановка
+    # программы. Слушатель клавиатуры работает глобально (pynput), из
+    # любого окна, поэтому бота не нужно держать в фокусе.
+    # =====================================================================
+    start_requested = threading.Event()
+    stop_requested = threading.Event()
+    bot_running = [False]
+    _space_down = [False]
+
+    def _on_key_press(key):
+        # Срабатываем ровно один раз на нажатие: повтор при удержании
+        # клавиши отсекаем флагом _space_down.
+        if key == _kb.Key.space and not _space_down[0]:
+            _space_down[0] = True
+            if bot_running[0]:
+                stop_requested.set()
+            else:
+                start_requested.set()
+
+    def _on_key_release(key):
+        if key == _kb.Key.space:
+            _space_down[0] = False
+
+    if HAS_PYNPUT:
+        _listener = _kb.Listener(on_press=_on_key_press,
+                                 on_release=_on_key_release)
+        try:
+            _listener.start()
+            print("Слушатель клавиатуры запущен (pynput): ПРОБЕЛ = старт/стоп.")
+        except Exception as exc:
+            print(f"Не удалось запустить слушатель клавиатуры ({exc}) — "
+                  f"управление только Ctrl+C.")
+    else:
+        print("ВНИМАНИЕ: pynput не установлен — ПРОБЕЛ не работает, "
+              "управление только Ctrl+C (pip install pynput).")
+
+    # ---- ЖДЁМ ПЕРВЫЙ ПРОБЕЛ (или Ctrl+C) ----
+    print("ГОТОВО: нажмите ПРОБЕЛ, когда игра на экране. "
+          "Повторный ПРОБЕЛ — остановка программы.")
+    try:
+        while not start_requested.is_set():
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        print("Выход по Ctrl+C до запуска.")
+        sys.exit(0)
+
+    bot_running[0] = True
+    print("ПРОБЕЛ: ЗАПУСК. Клики начались.")
+
     detector = Detector()
     detector.start()
 
@@ -810,6 +868,11 @@ if __name__ == '__main__':
     try:
         while True:
             now = time.monotonic()
+
+            # Второй ПРОБЕЛ — останавливаем программу начисто (со статистикой).
+            if stop_requested.is_set():
+                print("ПРОБЕЛ: остановка программы.")
+                break
 
             snap = detector.snapshot()
             if snap is None:          # первый кадр ещё считается
